@@ -1,0 +1,541 @@
+#!/usr/bin/env ruby
+# Read-only prototype for the validated sequential-clip Final Cut Pro layout.
+require 'json'
+require 'open3'
+require 'optparse'
+require 'tmpdir'
+require 'digest'
+
+module FCPChapters
+  VERSION = '0.5.17'
+  VERIFIED_CATALOG = '1195; 12.4 (454072)'
+  class Error < StandardError; end
+  class Plist
+    def initialize(data)
+      @data = data.b
+      raise Error, 'Invalid binary plist' unless @data.start_with?('bplist00') && @data.bytesize >= 40
+      @offset_size, @ref_size, @count, @top, table = @data[-32, 32].unpack('x6CCQ>Q>Q>')
+      raise Error, 'Unsupported plist limits' unless (1..8).cover?(@offset_size) && (1..8).cover?(@ref_size) && @count.between?(1, 100_000)
+      @offsets = @count.times.map { |i| uint(table + i * @offset_size, @offset_size) }
+      @cache = {}; @active = {}
+    end
+    def uint(pos, size)
+      b = @data.byteslice(pos, size)
+      raise Error, 'Truncated plist' unless b && b.bytesize == size
+      b.bytes.reduce(0) { |n, v| (n << 8) | v }
+    end
+    def object(i, depth = 0)
+      raise Error, 'Invalid or recursive plist' unless i.between?(0, @count - 1) && depth < 100 && !@active[i]
+      return @cache[i] if @cache.key?(i)
+      @active[i] = true
+      pos = @offsets[i]; marker = uint(pos, 1); pos += 1
+      type = marker >> 4; n = marker & 15
+      if [4, 5, 6, 10, 13].include?(type) && n == 15
+        m = uint(pos, 1); pos += 1
+        raise Error, 'Invalid plist length' unless m >> 4 == 1 && (m & 15) <= 3
+        size = 1 << (m & 15); n = uint(pos, size); pos += size
+      end
+      raise Error, 'Oversized plist object' if n > 1_000_000
+      refs = ->(at, count) { count.times.map { |j| object(uint(at + j * @ref_size, @ref_size), depth + 1) } }
+      value = case type
+      when 0
+        {0 => nil, 8 => false, 9 => true}.fetch(n) { raise Error, 'Unknown plist scalar' }
+      when 1
+        size = 1 << n; raise Error, 'Oversized integer' if size > 8
+        v = uint(pos, size); size == 8 && v >= 2**63 ? v - 2**64 : v
+      when 2, 3
+        size = 1 << n
+        raise Error, 'Unsupported float' unless [4, 8].include?(size)
+        @data.byteslice(pos, size).unpack1(size == 4 ? 'g' : 'G')
+      when 4 then @data.byteslice(pos, n)
+      when 5 then @data.byteslice(pos, n).force_encoding('UTF-8')
+      when 6 then @data.byteslice(pos, n * 2).force_encoding('UTF-16BE').encode('UTF-8')
+      when 8 then {uid: uint(pos, n + 1)}
+      when 10 then refs.call(pos, n)
+      when 13 then refs.call(pos, n).zip(refs.call(pos + n * @ref_size, n)).to_h
+      else raise Error, "Unsupported plist type #{type}"
+      end
+      @active.delete(i); @cache[i] = value
+    end
+    def decoded
+      archive = object(@top)
+      raise Error, 'Expected keyed archive' unless archive['$archiver'] == 'NSKeyedArchiver'
+      objects = archive.fetch('$objects')
+      resolve = nil
+      resolve = lambda do |v, seen = []|
+        raise Error, 'Archive nesting limit' if seen.length > 100
+        if v.is_a?(Hash) && v.key?(:uid)
+          id = v[:uid]; return nil if id == 0
+          raise Error, 'Invalid archive reference' unless id < objects.length && !seen.include?(id)
+          return resolve.call(objects[id], seen + [id])
+        end
+        return v.map { |x| resolve.call(x, seen) } if v.is_a?(Array)
+        return v unless v.is_a?(Hash)
+        if v.key?('NS.keys')
+          return resolve.call(v['NS.keys'], seen).zip(resolve.call(v['NS.objects'], seen)).to_h
+        end
+        return resolve.call(v['NS.objects'], seen) if v.key?('NS.objects')
+        klass = v['$class']; return nil if klass && objects.fetch(klass.fetch(:uid))['$classname'] == 'NSNull'
+        v.reject { |k, _| k == '$class' }.transform_values { |x| resolve.call(x, seen) }
+      end
+      resolve.call(archive.fetch('$top').fetch('root'))
+    end
+  end
+
+  def self.query(path, sql)
+    out, err, status = Open3.capture3('/usr/bin/sqlite3', '-readonly', '-json', path, sql)
+    raise Error, "SQLite read failed: #{err.strip}" unless status.success?
+    out.strip.empty? ? [] : JSON.parse(out)
+  end
+  def self.rational(s)
+    raise Error, 'Unsupported rational time' unless s.is_a?(String) && s.match?(/\A-?\d+\/[1-9]\d*\z/)
+    Rational(s)
+  end
+  def self.pair(s)
+    match = /\A\{\((-?\d+\/[1-9]\d*)\),\((-?\d+\/[1-9]\d*)\)\}\z/.match(s.to_s)
+    raise Error, 'Unsupported time pair' unless match
+    [rational(match[1]), rational(match[2])]
+  end
+  def self.extract(path, discover: false, project_pk: nil, diagnostics: false, validate_timing: false)
+    required = {
+      'ZCOLLECTION' => %w[Z_PK ZTYPE ZNAME ZIDENTIFIER ZMETADATA],
+      'ZCOLLECTIONMD' => %w[Z_PK ZDICTIONARYDATA],
+      'Z_3CHILDCOLLECTIONS' => %w[Z_3PARENTCOLLECTIONS Z_3CHILDCOLLECTIONS]
+    }
+    required.each do |table, columns|
+      present = query(path, "PRAGMA table_info(#{table});").map { |c| c['name'] }
+      missing = columns - present
+      raise Error, "Unsupported database structure: #{table} missing #{missing.join(', ')}" unless missing.empty?
+    end
+    rows = query(path, 'SELECT c.Z_PK AS pk,c.ZTYPE AS type,c.ZNAME AS name,c.ZIDENTIFIER AS id,hex(m.ZDICTIONARYDATA) AS data FROM ZCOLLECTION c LEFT JOIN ZCOLLECTIONMD m ON c.ZMETADATA=m.Z_PK;')
+    rows.each { |r| r['md'] = r['data'].empty? ? {} : Plist.new([r['data']].pack('H*')).decoded }
+    edges = query(path, 'SELECT Z_3PARENTCOLLECTIONS AS parent,Z_3CHILDCOLLECTIONS AS child FROM Z_3CHILDCOLLECTIONS;')
+    extract_graph(rows, edges, path: path, discover: discover, project_pk: project_pk, diagnostics: diagnostics, validate_timing: validate_timing)
+  end
+
+  def self.extract_graph(rows, edges, path: nil, discover: false, project_pk: nil, diagnostics: false, validate_timing: false)
+    by_pk = rows.to_h { |r| [r['pk'], r] }
+    if diagnostics
+      keys = %w[displayName isProject isCompoundClip clippedRange mediaRange unclippedStart anchorPair anchoredLane aoFlags aoFlagsMask timecodeFrameDuration timecodeDisplayDropFrame transitionOverlapType transitionNilSourceFillType effectType effectID $order duration isChapter isTodo providerSourceKey]
+      records = rows.map do |row|
+        metadata = row['md'].select { |key, _| keys.include?(key) }
+        if %w[FFRetimingVideoEffect FFRetimingAudioEffect].include?(row['type'])
+          channel = row['md']['channelData']
+          metadata['channelData'] = channel.dup.force_encoding('UTF-8').scrub if channel.is_a?(String)
+          metadata['availableKeys'] = row['md'].keys.sort
+        end
+        {pk: row['pk'], type: row['type'], name: row['name'], id: row['id'], metadata: metadata}
+      end
+      return {project_pk: project_pk, objects: records, relationships: edges}
+    end
+    children = ->(r) { edges.select { |e| e['parent'] == r['pk'] }.map { |e| by_pk.fetch(e['child']) } }
+    relation = lambda do |r, name|
+      groups = children.call(r).select { |x| x['name'] == name }
+      raise Error, "Ambiguous #{name}" if groups.length > 1
+      next [] if groups.empty?
+      group = groups.first
+      items = children.call(group)
+      if group['type'] == 'NSArray'
+        order = group['md']['$order']
+        ids = items.map { |item| item['id'] }
+        raise Error, "Missing or inconsistent order for #{name}" unless order.is_a?(Array) && order.uniq.length == order.length && order.sort == ids.sort
+        indexed = items.to_h { |item| [item['id'], item] }
+        items = order.map { |id| indexed.fetch(id) }
+      end
+      items
+    end
+    projects = rows.select { |r| r['type'] == 'FFAnchoredCollection' && r['md']['isProject'] == true }
+    return projects.map { |p| {name: p['md']['displayName'], pk: p['pk'], database: path} } if discover
+    projects = projects.select { |p| p['pk'] == project_pk } if project_pk
+    raise Error, 'Select one timeline root' unless projects.length == 1
+    project = projects.first
+    raise Error, 'Nonzero project origin unsupported' unless rational(project['md']['unclippedStart']) == 0
+    sequences = rows.select { |r| r['type'] == 'FFAnchoredSequence' && relation.call(r, 'primaryObject').include?(project) }
+    raise Error, 'Ambiguous project sequence' unless sequences.length == 1
+    infos = relation.call(sequences.first, 'sequenceInfo')
+    raise Error, 'Missing sequence info' unless infos.length == 1
+    start, duration = pair(infos.first['md']['mediaRange'])
+    if start == 0 && duration == 0 && relation.call(project, 'containedItems').empty? && relation.call(project, 'anchoredItems').empty?
+      return {notes: [], transitions: 0, retimed_clips: 0, name: project['md']['displayName'],
+              duration: duration, frame_rate: nil, chapters: [], clips: [],
+              excluded_chapters: 0, timing_skipped: true, empty_project: true}
+    end
+    frame_duration = rational(infos.first['md']['timecodeFrameDuration'])
+    raise Error, 'Invalid project range or frame duration' unless start == 0 && duration > 0 && frame_duration > 0
+    # Conservatively scan every reachable relationship, including nested and
+    # connected objects and references. A possible chapter keeps timing checks
+    # active; only proven absence permits the fast path. Cycles are harmless.
+    unless validate_timing
+      adjacency = edges.group_by { |edge| edge['parent'] }
+      seen = {}; pending = [project['pk']]; has_chapters = false
+      until pending.empty?
+        pk = pending.pop
+        next if seen[pk]
+        seen[pk] = true
+        node = by_pk.fetch(pk)
+        if node['md']['isChapter']
+          has_chapters = true
+          break
+        end
+        pending.concat(adjacency.fetch(pk, []).map { |edge| edge['child'] })
+      end
+      unless has_chapters
+        return {notes: [], transitions: 0, retimed_clips: 0, name: project['md']['displayName'],
+                duration: duration, frame_rate: 1 / frame_duration, chapters: [], clips: [],
+                excluded_chapters: 0, timing_skipped: true}
+      end
+    end
+    clips = relation.call(project, 'containedItems')
+    raise Error, 'Timeline contains no clips' if clips.empty?
+    raise Error, 'Project-level connected items unsupported' unless relation.call(project, 'anchoredItems').empty?
+    describe = ->(r) { "#{r['md']['displayName'] || r['name'] || '(unnamed)'} [#{r['type']}, row #{r['pk']}]" }
+    # Follow ownership edges, never effect-to-owner back references or media catalogs.
+    owned = lambda do |root, direct_effects = false|
+      seen = {}; pending = [root]; found = []
+      until pending.empty?
+        node = pending.pop
+        next if seen[node['pk']]
+        seen[node['pk']] = true
+        next if direct_effects && node != root && node['type'].start_with?('FFAnchored')
+        found << node
+        next if %w[persistedAnchoredObject media assetReferences clipReferences sequenceInfo userDefaults].include?(node['name'])
+        pending.concat(children.call(node))
+      end
+      found
+    end
+    retimed = []; notes = []
+    check_effects = lambda do |clip|
+      effects = owned.call(clip, true)
+      effects.each do |r|
+        if %w[FFRetimingVideoEffect FFRetimingAudioEffect].include?(r['type'])
+          begin
+            require 'rexml/document'
+          rescue LoadError
+            raise Error, 'Retiming inspection requires the Ruby rexml library (gem install rexml).'
+          end
+          xml = r['md']['channelData']
+          raise Error, "Missing retiming data on #{describe.call(clip)}: #{describe.call(r)}; metadata keys=#{r['md'].keys.sort.join(', ')}" unless xml.is_a?(String) && !xml.include?('<!ENTITY')
+          begin
+            doc = REXML::Document.new(xml)
+            map = REXML::XPath.first(doc, '//parameter[@name="Time Map"]/curve')
+            raise Error, 'missing Time Map curve' unless map
+            raise Error, 'unknown time-map curve representation' unless map.attributes['type'] == '1'
+            reverse = REXML::XPath.first(doc, '//parameter[@name="Reverse"]/curve')
+            raise Error, 'reverse playback' if reverse && (reverse.attributes['value'] != '0' || !reverse.get_elements('keypoint').empty?)
+            points = map.get_elements('keypoint').map do |k|
+              raise Error, 'unknown time-map interpolation' unless k.attributes['interpolation'] == '18'
+              t = k.elements['time'].text.split.map { |x| Integer(x) }
+              raise Error, 'invalid time-map coordinate' unless t.length == 4 && t[1] > 0 && [1, 3].include?(t[2]) && t[3] == 0
+              [Rational(t[0], t[1]), Rational(k.elements['value'].text)]
+            end
+            raise Error, 'reverse, freeze or non-monotonic time map' unless points.length >= 2 && points.each_cons(2).all? { |a, b| b[0] > a[0] && b[1] > a[1] }
+            from, length = pair(clip['md']['clippedRange'])
+            raise Error, "time map does not cover visible range: checked owner=#{describe.call(clip)}, visible=#{from}..#{from + length} seconds, map=#{points.first[0]}..#{points.last[0]} seconds, tolerance=#{frame_duration} seconds" unless from >= points.first[0] - frame_duration && from + length <= points.last[0] + frame_duration
+          rescue REXML::ParseException, ArgumentError, NoMethodError, Error => e
+            raise Error, "Unsupported retiming on #{describe.call(clip)}: #{describe.call(r)} — #{e.message}"
+          end
+          notes << "Audio retiming on #{describe.call(clip)} uses the supported forward Time Map format; this audio representation has diagnostic and synthetic test coverage; chapter positions still need verification in Final Cut Pro." if r['type'] == 'FFRetimingAudioEffect'
+          retimed << clip['id']
+        elsif r['type'].match?(/Retim|TimeMap|Speed|Multicam/i)
+          raise Error, "Unsupported timing on #{describe.call(clip)}: #{describe.call(r)}"
+        elsif r['type'].end_with?('Effect') && !%w[effect.video.filter effect.video.compositor effect.audio.effect effect.audio.filter effect.video.title effect.video.generator effect.video.transition effect.audio.transition].include?(r['md']['effectType'])
+          raise Error, "Unsupported effect category on #{describe.call(clip)}: #{describe.call(r)} (#{r['md']['effectType'].inspect})"
+        end
+      end
+    end
+    primary_types = %w[FFAnchoredCollection FFAnchoredGeneratorComponent]
+    transitions = clips.select { |c| c['type'] == 'FFAnchoredTransition' }
+    transition_errors = []
+    transitions.each do |tr|
+      i = clips.index(tr)
+      previous = i.zero? ? nil : clips[i - 1]
+      following = clips[i + 1]
+      details = "overlap=#{tr['md']['transitionOverlapType'].inspect}, fill=#{tr['md']['transitionNilSourceFillType'].inspect}, range=#{tr['md']['clippedRange'].inspect}, previous=#{previous ? describe.call(previous) : '(start)'}, next=#{following ? describe.call(following) : '(end)'}"
+      # Fill behavior does not select the timeline arithmetic. Keep the verified
+      # overlap mode guard independent of the rendering effect and fill mode.
+      if tr['md']['transitionOverlapType'] != 1
+        transition_errors << "#{describe.call(tr)}: unverified overlap mode; #{details}"
+      elsif (previous && !primary_types.include?(previous['type'])) || (following && !primary_types.include?(following['type']))
+        transition_errors << "#{describe.call(tr)}: unsupported neighboring item; #{details}"
+      end
+      check_effects.call(tr)
+    end
+    unless transition_errors.empty?
+      raise Error, "Transition timing needs support (#{transition_errors.length}):\n      " + transition_errors.join("\n      ")
+    end
+    notes << 'Transition offsets use the observed centered-overlap layout; verify these new positions in Final Cut Pro.' unless transitions.empty?
+    offset = Rational(0)
+    chapters = []; excluded = 0; clip_details = []
+    clips.each do |clip|
+      md = clip['md']
+      if clip['type'] == 'FFAnchoredTransition'
+        _, transition_duration = pair(md['clippedRange'])
+        raise Error, "Invalid transition duration: #{describe.call(clip)}" unless transition_duration > 0
+        # In the observed layout, the leading half precedes the first clip.
+        # The trailing overlap is already accounted for by the final clip range.
+        offset += transition_duration / 2 if clip == clips.first
+        next
+      end
+      check_effects.call(clip)
+      raise Error, "Unsupported primary item: #{describe.call(clip)}" unless primary_types.include?(clip['type'])
+      raise Error, "Nested project or compound clip unsupported: #{describe.call(clip)} (isCompoundClip=#{md['isCompoundClip'].inspect}, isProject=#{md['isProject'].inspect})" if md['isCompoundClip'] || md['isProject']
+      clip_start, clip_duration = pair(md['clippedRange'])
+      if md.key?('anchorPair')
+        anchor = pair(md['anchorPair'])
+        canonical_anchor = anchor == [clip_start, Rational(0)]
+        # Primary containedItems membership establishes sequential placement.
+        # An item's retained anchor is provenance, not an extra timeline offset.
+        unless canonical_anchor && retimed.include?(clip['id'])
+          notes << "Primary storyline item #{md['displayName'].inspect} retains anchor metadata; placement uses storyline order and trim. Verify chapters after this item in Final Cut Pro."
+        end
+      end
+      raise Error, 'Invalid clip duration' unless clip_duration > 0
+      components = relation.call(clip, 'containedItems')
+      if clip['type'] == 'FFAnchoredGeneratorComponent'
+        raise Error, "Unexpected contained items on generator: #{describe.call(clip)}" unless components.empty?
+      else
+        raise Error, "Unsupported clip components: #{describe.call(clip)}" unless components.length == 1 && components.first['type'] == 'FFAnchoredMediaComponent'
+      end
+      markers = relation.call(clip, 'anchoredItems')
+      markers.reject { |m| m['type'] == 'FFAnchoredTimeMarker' }.each do |attached|
+        check_effects.call(attached)
+        descendants = owned.call(attached)
+        chapter = descendants.find { |r| r['type'] == 'FFAnchoredTimeMarker' && r['md']['isChapter'] }
+        raise Error, "Chapter on connected clip needs an anchor transform: #{describe.call(attached)} / #{describe.call(chapter)}" if chapter
+        permitted = %w[FFAnchoredCollection FFAnchoredGeneratorComponent FFAnchoredMediaComponent]
+        raise Error, "Unsupported connected item on #{describe.call(clip)}: #{describe.call(attached)}" unless permitted.include?(attached['type']) && !attached['md']['isCompoundClip']
+      end
+      markers.select { |r| r['type'] == 'FFAnchoredTimeMarker' && r['md']['isChapter'] == true }.each do |r|
+        first, second = pair(r['md']['anchorPair'])
+        raise Error, 'Nonzero marker anchor unsupported' unless first == 0
+        local = second - clip_start
+        # Trimmed-out records remain attached to clip instances. The end is exclusive.
+        unless local >= 0 && local < clip_duration
+          excluded += 1
+          next
+        end
+        t = offset + local
+        chapters << {title: r['md'].fetch('displayName').gsub(/[\r\n\t]+/, ' '), time: t, id: r['id'], clip_id: clip['id'], clip_name: md['displayName']}
+      end
+      clip_details << {id: clip['id'], name: md['displayName'], anchor_pair: md['anchorPair'], timeline_start: offset.to_s, local_start: clip_start.to_s, duration: clip_duration.to_s}
+      offset += clip_duration
+    end
+    unless offset == duration
+      delta = duration - offset
+      describe_time = ->(t) { "#{t} seconds (#{format('%.6f', t.to_f)}s)" }
+      items = clips.map.with_index do |item, index|
+        "#{index + 1}. #{describe.call(item)}; clippedRange=#{item['md']['clippedRange'].inspect}, anchorPair=#{item['md']['anchorPair'].inspect}"
+      end
+      if items.length > 20
+        items = items.first(10) + ["... #{items.length - 20} middle items omitted ..."] + items.last(10)
+      end
+      raise Error, "Ordered clip durations do not match timeline duration. Stored Project duration: #{describe_time.call(duration)}; calculated: #{describe_time.call(offset)}; difference (stored minus calculated): #{describe_time.call(delta)} / #{delta / frame_duration} frames. #{clip_details.length} clips, #{transitions.length} transitions. No chapters emitted because their positions may be wrong. Storyline items:\n      #{items.join("\n      ")}"
+    end
+    notes << 'Retimed marker positions are read from Final Cut’s adjusted coordinates; verify these new positions in Final Cut Pro.' unless retimed.empty?
+    {notes: notes, transitions: transitions.length, retimed_clips: retimed.uniq.length, name: project['md']['displayName'], duration: duration, frame_rate: 1 / frame_duration, chapters: chapters.sort_by { |c| c[:time] }, clips: clip_details, excluded_chapters: excluded}
+  end
+  def self.format_time(time)
+    seconds = time.floor
+    seconds >= 3600 ? format('%d:%02d:%02d', seconds / 3600, seconds / 60 % 60, seconds % 60) : format('%02d:%02d', seconds / 60, seconds % 60)
+  end
+  def self.render(project)
+    chapters = project[:chapters].map(&:dup)
+    return [[], []] if chapters.empty?
+    timestamps = chapters.map { |c| c[:time].floor }.uniq
+    chapters.unshift({title: 'Intro', time: Rational(0), id: nil}) if !timestamps.include?(0) && timestamps.length >= 2
+    warnings = []
+    warnings << 'YouTube requires at least three distinct chapter timestamps.' if chapters.map { |c| c[:time].floor }.uniq.length < 3
+    warnings << 'YouTube chapters must start at 00:00; Intro was not added because there are too few distinct chapter timestamps.' unless chapters.any? { |c| c[:time].floor == 0 }
+    chapters.each_with_index do |c, i|
+      next_time = chapters[i + 1]&.fetch(:time)
+      span = (next_time ? next_time.floor : project[:duration]) - c[:time].floor
+      warnings << "Chapter #{format_time(c[:time])} #{c[:title].inspect} is shorter than 10 seconds (#{span.to_f.round(3)}s after timestamp formatting)." if span < 10
+      warnings << "Duplicate timestamp #{format_time(c[:time])}." if next_time && next_time.floor == c[:time].floor
+    end
+    [chapters, warnings]
+  end
+  def self.run(argv)
+    options = {}
+    $stdout.sync = true
+    $stderr.sync = true
+    parser = OptionParser.new do |o|
+      o.banner = 'Usage: fcpchapters LIBRARY.fcpbundle [--project NAME | --all] [--plain | --json] [--list-projects]'
+      o.on('--all', 'Process all Projects') { options[:all] = true }
+      o.on('--project NAME') { |v| options[:project] = v }
+      o.on('--version') { puts "fcpchapters #{VERSION}"; return 0 }
+      o.on('--plain', 'Only chapter text on stdout') { options[:plain] = true }
+      o.on('--diagnostics', 'Export timing metadata as JSON, even when extraction fails') { options[:diagnostics] = true; options[:json] = true }
+      o.on('--json') { options[:json] = true }
+      o.on('--list-projects') { options[:list] = true }
+      o.on('-h', '--help') { puts o; return 0 }
+    end
+    parser.parse!(argv)
+    raise Error, '--plain and --json cannot be combined' if options[:plain] && options[:json]
+    raise Error, '--diagnostics and --list-projects cannot be combined' if options[:diagnostics] && options[:list]
+    raise Error, '--all and --project cannot be combined' if options[:all] && options[:project]
+    report = !options[:plain] && !options[:json] && !options[:list]
+    info = ->(message) { report ? puts(message) : warn(message) }
+    info.call("\nfcpchapters #{VERSION}")
+    raise Error, parser.to_s unless argv.length == 1
+    root = File.realpath(argv.first)
+    raise Error, 'Expected a .fcpbundle directory' unless File.directory?(root) && root.end_with?('.fcpbundle')
+    library_name = File.basename(root, '.fcpbundle')
+    _, _, running = Open3.capture3('/usr/bin/pgrep', '-x', 'Final Cut Pro')
+    raise Error, 'Close Final Cut Pro before reading a library.' if running.success?
+    info.call("Reading library metadata: #{File.basename(root).inspect}")
+    info.call('Checking database structure and extracting chapter markers from temporary copies (read-only).')
+    version = 'unknown'
+    version_file = File.join(root, 'CurrentVersion.plist')
+    if File.exist?(version_file)
+    version_path = File.realpath(version_file)
+    raise Error, 'Version file points outside library' unless version_path.start_with?(root + '/')
+    version, _, version_status = Open3.capture3('/usr/bin/plutil', '-extract', 'catalogVersion', 'raw', '-o', '-', version_path)
+    version = version_status.success? ? version.strip : 'unknown'
+    end
+    info.call("Library catalog version: #{version}")
+    compatibility_warnings = version == VERIFIED_CATALOG ? [] : ['This catalog version has not been tested with a real library fixture. Reading by structure; verify the resulting times in Final Cut Pro.']
+    files = Dir.glob(File.join(root, '**', 'CurrentVersion.fcpevent')).sort
+    raise Error, 'No event databases found' if files.empty?
+    projects = []; fingerprints = {}
+    Dir.mktmpdir('fcpchapters-') do |tmp|
+      files.each_with_index do |source, index|
+        real = File.realpath(source)
+        raise Error, 'Database points outside library' unless real.start_with?(root + '/')
+        raise Error, 'Database sidecars require a supported snapshot; close Final Cut cleanly first.' if %w[-wal -shm -journal].any? { |suffix| File.exist?(source + suffix) }
+        raise Error, 'Database too large for prototype' if File.size(real) > 100_000_000
+        before = File.binread(real); target = File.join(tmp, "#{index}.sqlite")
+        File.binwrite(target, before)
+        fingerprints[real] = Digest::SHA256.hexdigest(before)
+        raise Error, 'Library changed during snapshot' unless File.binread(real) == before
+        projects.concat(extract(target, discover: true).map { |p| p.merge(location: source.delete_prefix(root + '/')) })
+      end
+      fingerprints.each do |source, digest|
+        raise Error, 'Library changed during inspection' unless Digest::SHA256.file(source).hexdigest == digest && !%w[-wal -shm -journal].any? { |suffix| File.exist?(source + suffix) }
+      end
+      # Event databases live directly in an Event folder. A project's own
+      # database is deeper; do not mistake an event database without roots for
+      # an empty Event when it contains separate project databases.
+      event_names = files.filter_map do |source|
+        parts = source.delete_prefix(root + '/').split('/')
+        parts.first if parts.length == 2
+      end.uniq
+      empty_events = event_names.reject do |event|
+        projects.any? { |p| p[:location].start_with?(event + '/') }
+      end
+      info.call('') unless empty_events.empty?
+      empty_events.each { |event| info.call("Event #{event.inspect}: No Projects found in the Event. Nothing to output.") }
+      if projects.empty?
+        raise Error, "Project #{options[:project].inspect} was not found in this Library." if options[:project]
+        info.call("\nNo Projects found in Library #{library_name.inspect}. Nothing to output.")
+        puts JSON.pretty_generate({version: VERSION, timelines: [], errors: [], empty_events: empty_events}) if options[:json]
+        return 0
+      end
+      info.call("\nFound #{projects.length} #{projects.length == 1 ? 'Project' : 'Projects'} in Library #{library_name.inspect}:")
+      projects.each_with_index do |p, i|
+        label = "  #{i + 1}. #{p[:name].inspect}"
+        label += " (#{p[:location]})" if projects.count { |other| other[:name] == p[:name] } > 1
+        options[:list] ? puts(label) : info.call(label)
+      end
+      info.call('')
+      return 0 if options[:list]
+      if options[:all]
+        selected = projects
+        info.call('Processing all available Projects.')
+      elsif options[:project]
+        selected = projects.select { |p| p[:name] == options[:project] }
+        raise Error, 'Project name is missing or ambiguous; use the interactive picker to select it.' unless selected.length == 1
+      elsif projects.length == 1
+        selected = projects
+        info.call('Only one Project is available, so I’ll process it automatically.')
+      else
+        loop do
+          $stderr.print 'Which Project do you want to process? Enter Project number or A for all: '
+          answer = $stdin.gets
+          raise Error, 'No selection received. Use --project NAME or --all for unattended runs.' unless answer
+          answer = answer.strip
+          if answer.empty? || answer.casecmp('a').zero? || answer.casecmp('all').zero?
+            selected = projects; break
+          elsif answer.match?(/\A[0-9]+\z/) && answer.to_i.between?(1, projects.length)
+            selected = [projects[answer.to_i - 1]]; break
+          end
+          warn "Please enter a number from 1 to #{projects.length}, or A."
+        end
+      end
+      results = []; failures = []
+      selected.each do |entry|
+        begin
+          heading = "Processing Project #{entry[:name].inspect} in Library #{library_name.inspect}."
+          info.call("\n#{heading}")
+          info.call('=' * heading.length)
+          if options[:diagnostics]
+            diagnostic = extract(entry[:database], project_pk: entry[:pk], diagnostics: true)
+            begin
+              extract(entry[:database], project_pk: entry[:pk], validate_timing: true)
+              diagnostic[:extraction_error] = nil
+            rescue Error, KeyError => e
+              diagnostic[:extraction_error] = e.message
+            end
+            results << diagnostic.merge(project: entry[:name], location: entry[:location])
+            info.call('Collected timing diagnostics; no chapter output requested.')
+            next
+          end
+          project = extract(entry[:database], project_pk: entry[:pk])
+          chapters, warnings = render(project)
+          warnings = (compatibility_warnings + project[:notes]).map { |message| "[Beta] #{message}" } + warnings
+          info.call("Processed #{project[:clips].length} #{project[:clips].length == 1 ? "clip" : "clips"}; excluded #{project[:excluded_chapters]} chapter markers outside the clips’ trimmed ranges.") unless project[:timing_skipped]
+          found = project[:chapters].length
+          added = chapters.length - found
+          info.call("Frame rate: #{format("%.6g", project[:frame_rate].to_f)} fps") unless project[:empty_project]
+          if project[:empty_project]
+            info.call('This Project is empty; nothing to output.')
+          elsif found.zero?
+            info.call('Found 0 chapter markers; nothing to output')
+          else
+            info.call("Found #{found} chapter #{found == 1 ? 'marker' : 'markers'}; added #{added} Intro chapter; #{chapters.length} #{chapters.length == 1 ? 'entry' : 'entries'} in output.")
+          end
+          unless warnings.empty?
+            warn "\nWarnings — #{project[:name].inspect} (#{warnings.length})"
+            warnings.each { |w| warn "  - #{w}" }
+            warn ''
+          end
+          result = {empty_project: !!project[:empty_project], timing_skipped: !!project[:timing_skipped], transitions: project[:transitions], retimed_clips: project[:retimed_clips], clips: project[:clips], excluded_chapters: project[:excluded_chapters], version: VERSION, found_chapters: found, added_intro: added == 1, project: project[:name], location: entry[:location], frame_rate: project[:frame_rate]&.to_s, duration: project[:duration].to_s, chapters: chapters.map { |c| {title: c[:title], seconds: c[:time].to_s, timestamp: format_time(c[:time]), id: c[:id], clip_id: c[:clip_id], clip_name: c[:clip_name]} }, warnings: warnings}
+          results << result
+          unless options[:json] || chapters.empty?
+            puts "Project: #{project[:name].inspect} (#{entry[:location]})" if options[:plain] && selected.length > 1
+            if report
+              puts "\n#{project[:name].inspect}"
+              puts '------------------------------------------------------------'
+            end
+            chapters.each { |c| puts "#{format_time(c[:time])} #{c[:title]}" }
+            puts "------------------------------------------------------------\nPaste the chapters into the YouTube description box.\n\n" if report
+            puts if options[:plain] && selected.length > 1
+          end
+        rescue Error, KeyError => e
+          info.call("No chapter output for this Project.\nReason:\n#{e.message.lines.map { |line| "  #{line.chomp}" }.join("\n")}\n\n")
+          failures << {project: entry[:name], location: entry[:location], error: e.message}
+        end
+      end
+      unless failures.empty?
+        warn "\nErrors (#{failures.length})"
+        failures.each { |f| warn "  - Project #{f[:project].inspect} (#{f[:location]}): no chapter output. See the reason above." }
+        warn ''
+      end
+      if options[:json]
+        payload = if options[:diagnostics]
+          {version: VERSION, diagnostic_format: 1, library: library_name, catalog_version: version, projects: results, errors: failures}
+        else
+          selected.length == 1 && failures.empty? ? results.first : {version: VERSION, timelines: results, errors: failures, empty_events: empty_events}
+        end
+        puts JSON.pretty_generate(payload)
+      end
+      return 1 unless failures.empty?
+    end
+    0
+  rescue Error, OptionParser::ParseError, SystemCallError, KeyError, JSON::ParserError => e
+    warn "\nErrors\n  - #{e.message}\n\n"; 1
+  ensure
+    # Keep machine-readable stdout intact; terminal status ends on stderr.
+    warn ''
+  end
+end
+exit FCPChapters.run(ARGV) if $PROGRAM_NAME == __FILE__

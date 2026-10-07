@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.fcpbundle/
+*.fcpevent
+*.sqlite
+*.sqlite3
+*.zip
+*-diagnostics.json
+chapters.txt
+fixtures/
+private/
+work/
